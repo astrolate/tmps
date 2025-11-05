@@ -1,65 +1,80 @@
+# batch_ns.py（抜粋）
+import asyncio
+from typing import Any, Dict
+from flask import request, current_app
+from flask_restx import Namespace, Resource, abort
+
+def _coerce_jsonable(obj: Any) -> Any:
+    from decimal import Decimal
+    import datetime, uuid
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, (datetime.datetime, datetime.date, datetime.time, Decimal, uuid.UUID)):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _coerce_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_coerce_jsonable(v) for v in obj]
+    return str(obj)
+
 @batch.route("/<path:subpath>")
 class BatchProxyResource(Resource):
     def post(self, subpath: str):
-        # --- ここはリクエストコンテキスト内。今のうちに全部抜き取る ---
-        app = current_app._get_current_object()
-
-        try:
-            target_url = _normalize_target_path(subpath)
-        except ValueError as e:
-            return {"error": str(e)}, 400
-
-        # ヘッダは request から今のうちにスナップショット
-        forward_headers = _pick_forward_headers()  # 内部で request.headers を読むならここで完成させる
-        # 認証連携用のスナップショット（プロキシ終端型を想定）
-        remote_user = request.environ.get("REMOTE_USER")
-        # アプリ側でSPNEGOを直接受ける構成なら Authorization も事前取得
-        auth_header = request.headers.get("Authorization")
-        if auth_header:
-            forward_headers["Authorization"] = auth_header  # 念のため明示的に保持
+        key = subpath.strip("/")
+        handler = _HANDLER_REGISTRY.get(key)
+        if handler is None:
+            abort(404, f"Unknown subpath: {key}")
 
         payload = request.get_json(silent=True)
         if not isinstance(payload, list):
-            return {"error": "Request body must be a JSON array"}, 400
+            abort(400, "Request body must be a JSON array.")
 
-        default_workers = int(app.config.get("BATCH_MAX_WORKERS", 8))
-        try:
-            req_workers = int(request.args.get("workers", default_workers))
-        except (TypeError, ValueError):
-            req_workers = default_workers
-        max_workers = max(1, min(req_workers, 64))
+        normalized, seen = [], set()
+        for i, item in enumerate(payload):
+            if not isinstance(item, dict) or "id" not in item or "data" not in item:
+                abort(400, f"Array item at index {i} must include 'id' and 'data'.")
+            _id = item["id"]
+            if _id in seen:
+                abort(400, f"Duplicate 'id' detected: {_id}")
+            seen.add(_id)
+            normalized.append({"id": _id, "data": item["data"]})
 
-        def worker(idx_item, app=app, target_url=target_url,
-                   headers=forward_headers, remote_user=remote_user):
-            idx, item = idx_item
-            # スレッド側では request を絶対に参照しない
-            with app.app_context():
-                with app.test_client() as client:
-                    environ = {}
-                    if remote_user:
-                        environ["REMOTE_USER"] = remote_user  # プロキシ終端の認証結果を継承
-                    resp = client.post(
-                        target_url,
-                        json=item,
-                        headers=headers,
-                        environ_overrides=environ
-                    )
+        workers = request.args.get("workers", type=int) or min(8, max(1, len(normalized)))
+        timeout = request.args.get("timeout", type=float)  # 秒
+        app = current_app._get_current_object()
+
+        async def run_all():
+            sem = asyncio.Semaphore(workers)
+            results = []
+
+            async def run_one(_id: str, data: Dict[str, Any]):
+                async with sem:
+                    def _impl():
+                        with app.app_context():
+                            return handler(data)
                     try:
-                        body = resp.get_json()
-                    except Exception:
-                        body = resp.get_data(as_text=True)
-                    return {"index": idx, "status": resp.status_code,
-                            "ok": 200 <= resp.status_code < 300, "body": body}
+                        value = await asyncio.to_thread(_impl)
+                        results.append({"id": _id, "ok": True, "result": _coerce_jsonable(value)})
+                    except Exception as e:
+                        results.append({"id": _id, "ok": False, "error": str(e)})
 
-        items = list(enumerate(payload))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(worker, items))
+            tasks = [run_one(it["id"], it["data"]) for it in normalized]
+            # 完了順で append したいので as_completed 相当で待つ
+            for coro in asyncio.as_completed(tasks, timeout=timeout):
+                try:
+                    await coro
+                except asyncio.TimeoutError:
+                    # タイムアウトした分は後で拾えないので明示的にエラーとして記録
+                    results.append({"id": "<timeout>", "ok": False, "error": "timeout"})
+            return results
 
-        results.sort(key=lambda r: r["index"])
-        any_ok = any(r["ok"] for r in results)
+        results = asyncio.run(run_all())
+        status = _decide_status(results)
         return {
-            "target": target_url,
+            "subpath": key,
             "count": len(results),
-            "results": results,
-            "workers": max_workers,
-        }, (200 if any_ok else 502)
+            "succeeded": sum(1 for r in results if r.get("ok")),
+            "failed": sum(1 for r in results if r and not r.get("ok")),
+            "items": results,            # 完了順
+            "parallelism": {"max_workers": workers, "timeout": timeout},
+        }, status
